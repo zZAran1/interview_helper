@@ -1,21 +1,22 @@
 package com.example.interview_helper_backend.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.example.interview_helper_backend.exception.AiException;
 import com.example.interview_helper_backend.mapper.SessionMessageMapper;
 import com.example.interview_helper_backend.model.entity.SessionMessage;
 import com.example.interview_helper_backend.service.SessionMessageService;
 import org.springframework.stereotype.Service;
 import com.example.interview_helper_backend.client.AiClient;
-
+import java.util.concurrent.locks.ReentrantLock;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.stream.Collectors;
-
+import com.example.interview_helper_backend.util.InterviewLocks;
 @Service
 public class SessionMessageServiceImpl extends ServiceImpl<SessionMessageMapper, SessionMessage> implements SessionMessageService {
 
     private static final int MAX_MESSAGE_LENGTH = 1024;
+    //拼进AI上下文的最大消息条数：只取最近N条，防止长对话超出模型上下文限制
+    private static final int MAX_CONTEXT_MESSAGES = 20;
 
     private final AiClient aiClient;
 
@@ -40,16 +41,22 @@ public class SessionMessageServiceImpl extends ServiceImpl<SessionMessageMapper,
 
     @Override
     public void reply(Integer interviewId, String userText) {
-        SessionMessage userMessage = new SessionMessage();
-        userMessage.setInterview_id(interviewId);
-        userMessage.setRole(SessionMessage.Role.user);
-        userMessage.setMessagetext(userText);
-        userMessage.setSend_date(LocalDateTime.now());
-        this.save(userMessage);
+        ReentrantLock lock = InterviewLocks.getLock(interviewId);
+        lock.lock();
+        try {
+            SessionMessage userMessage = new SessionMessage();
+            userMessage.setInterview_id(interviewId);
+            userMessage.setRole(SessionMessage.Role.user);
+            userMessage.setMessagetext(userText);
+            userMessage.setSend_date(LocalDateTime.now());
+            this.save(userMessage);
 
-        String conversation = buildConversationText(interviewId);
-        String aiText = aiClient.reply(conversation);
-        saveAiMessage(interviewId, aiText);
+            String conversation = buildConversationText(interviewId);
+            String aiText = aiClient.reply(conversation);
+            saveAiMessage(interviewId, aiText);
+        } finally {
+            lock.unlock();   // 必须放在 finally，异常时也要释放，否则这场面试永久卡死
+        }
     }
 
     @Override
@@ -62,7 +69,12 @@ public class SessionMessageServiceImpl extends ServiceImpl<SessionMessageMapper,
 
     @Override
     public String buildConversationText(Integer interviewId) {
-        return listMessages(interviewId).stream()
+        List<SessionMessage> messages = listMessages(interviewId);
+        //只取最近N条拼进上下文，防止长对话超出模型上下文限制
+        if (messages.size() > MAX_CONTEXT_MESSAGES) {
+            messages = messages.subList(messages.size() - MAX_CONTEXT_MESSAGES, messages.size());
+        }
+        return messages.stream()
                 .map(message -> (message.getRole() == SessionMessage.Role.ai ? "面试官：" : "求职者：") + message.getMessagetext())
                 .collect(Collectors.joining("\n"));
     }

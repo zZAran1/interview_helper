@@ -19,7 +19,10 @@ import com.example.interview_helper_backend.service.ResumeService;
 import com.example.interview_helper_backend.service.SessionMessageService;
 import com.example.interview_helper_backend.util.UserContext;
 import org.springframework.stereotype.Service;
-
+import org.springframework.transaction.annotation.Transactional;
+import com.example.interview_helper_backend.util.InterviewLocks;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -29,6 +32,9 @@ import java.util.stream.Collectors;
 @Service
 public class InterviewServiceImpl extends ServiceImpl<InterviewMapper, Interview> implements InterviewService {
     private static final Pattern RATING_PATTERN = Pattern.compile("评分[：:]\\s*([0-9]+(?:\\.[0-9]+)?)");
+    //防止双击重复开始面试：同一用户在该时间窗口内只允许开始一场
+    private static final long DUPLICATE_START_WINDOW_SECONDS = 5;
+    private static final ConcurrentHashMap<Integer, ReentrantLock> USER_START_LOCKS = new ConcurrentHashMap<>();
 
     private final SessionMessageService sessionMessageService;
     private final ResumeService resumeService;
@@ -41,22 +47,38 @@ public class InterviewServiceImpl extends ServiceImpl<InterviewMapper, Interview
     @Override
     public InterviewVO startInterview() {
         int userId = UserContext.getUserId();
-        //先生成第一题再落库：AI失败时不会留下没有题目的空面试记录
-        String firstQuestion = sessionMessageService.getFirstQuestion(buildResumeContext());
-        if (firstQuestion == null || firstQuestion.isBlank()) {
-            //兜底：AI返回空题目时给一个默认开场问题，保证面试流程能继续
-            firstQuestion = "你好，请先做一个简短的自我介绍吧。";
+        ReentrantLock lock = USER_START_LOCKS.computeIfAbsent(userId, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            //防重复点击：时间窗口内已开始过面试则拒绝，避免重复创建记录和重复调用AI
+            boolean justStarted = lambdaQuery()
+                    .eq(Interview::getUser_id, userId)
+                    .ge(Interview::getCreated_at, LocalDateTime.now().minusSeconds(DUPLICATE_START_WINDOW_SECONDS))
+                    .count() > 0;
+            if (justStarted) {
+                throw new InterviewException("操作太频繁，请勿重复开始面试");
+            }
+
+            //先生成第一题再落库：AI失败时不会留下没有题目的空面试记录
+            String firstQuestion = sessionMessageService.getFirstQuestion(buildResumeContext());
+            if (firstQuestion == null || firstQuestion.isBlank()) {
+                //兜底：AI返回空题目时给一个默认开场问题，保证面试流程能继续
+                firstQuestion = "你好，请先做一个简短的自我介绍吧。";
+            }
+
+            Interview interview = new Interview();
+            interview.setUser_id(userId);
+            interview.setCreated_at(LocalDateTime.now());
+            interview.setStatus(Interview.STATUS_ONGOING);
+            this.save(interview);
+            sessionMessageService.saveAiMessage(interview.getId(), firstQuestion);
+
+            InterviewVO vo = Converter.INSTANCE.toInterviewVO(interview);
+            vo.setFirst_question(firstQuestion);
+            return vo;
+        } finally {
+            lock.unlock();
         }
-
-        Interview interview = new Interview();
-        interview.setUser_id(userId);
-        interview.setCreated_at(LocalDateTime.now());
-        this.save(interview);
-        sessionMessageService.saveAiMessage(interview.getId(), firstQuestion);
-
-        InterviewVO vo = Converter.INSTANCE.toInterviewVO(interview);
-        vo.setFirst_question(firstQuestion);
-        return vo;
     }
 
     @Override
@@ -71,33 +93,59 @@ public class InterviewServiceImpl extends ServiceImpl<InterviewMapper, Interview
                 .collect(Collectors.toList());
     }
 
+    @Transactional(rollbackFor = Exception.class)
     @Override
     public void deleteInterview(InterviewDTO dto) {
-        Interview interview = getOwnedInterview(dto.getId());
-        //session_message外键无级联删除，需先删除消息
-        sessionMessageService.deleteByInterviewId(interview.getId());
-        this.removeById(interview.getId());
+        ReentrantLock lock = InterviewLocks.getLock(dto.getId());
+        lock.lock();
+        try {
+            Interview interview = getOwnedInterview(dto.getId());
+            //session_message外键无级联删除，需先删除消息，两步在同一事务内原子完成
+            sessionMessageService.deleteByInterviewId(interview.getId());
+            this.removeById(interview.getId());
+        } finally {
+            lock.unlock();
+        }
     }
 
     @Override
     public InterviewVO endInterview(InterviewDTO dto) {
-        Interview interview = getOwnedInterview(dto.getId());
-        String conversation = sessionMessageService.buildConversationText(interview.getId());
-        if (conversation.isBlank()) {
-            throw new InterviewException("该面试暂无对话记录，无法评估");
+        ReentrantLock lock = InterviewLocks.getLock(dto.getId());
+        lock.lock();
+        try {
+            Interview interview = getOwnedInterview(dto.getId());
+            if (interview.getStatus() == Interview.STATUS_ENDED) {
+                throw new InterviewException("该面试已结束");
+            }
+            String conversation = sessionMessageService.buildConversationText(interview.getId());
+            if (conversation.isBlank()) {
+                throw new InterviewException("该面试暂无对话记录，无法评估");
+            }
+            String evaluation = sessionMessageService.evaluate(conversation);
+            interview.setRating(parseRating(evaluation));
+            interview.setSuggestion(parseSuggestion(evaluation));
+            interview.setStatus(Interview.STATUS_ENDED);
+            this.updateById(interview);
+            return Converter.INSTANCE.toInterviewVO(interview);
+        } finally {
+            lock.unlock();
         }
-        String evaluation = sessionMessageService.evaluate(conversation);
-        interview.setRating(parseRating(evaluation));
-        interview.setSuggestion(parseSuggestion(evaluation));
-        this.updateById(interview);
-        return Converter.INSTANCE.toInterviewVO(interview);
     }
 
     @Override
     public List<SessionMessageVO> sendMessage(SessionMessageDTO dto) {
-        getOwnedInterview(dto.getInterview_id());
-        sessionMessageService.reply(dto.getInterview_id(), dto.getMessagetext());
-        return toMessageVOs(dto.getInterview_id());
+        ReentrantLock lock = InterviewLocks.getLock(dto.getInterview_id());
+        lock.lock();
+        try {
+            Interview interview = getOwnedInterview(dto.getInterview_id());
+            if (interview.getStatus() == Interview.STATUS_ENDED) {
+                throw new InterviewException("面试已结束，无法继续发送消息");
+            }
+            sessionMessageService.reply(dto.getInterview_id(), dto.getMessagetext());
+            return toMessageVOs(dto.getInterview_id());
+        } finally {
+            lock.unlock();
+        }
     }
 
     @Override

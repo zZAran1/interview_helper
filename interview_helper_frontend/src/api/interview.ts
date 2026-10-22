@@ -2,7 +2,7 @@ import client from './client'
 
 export interface InterviewData {
   id: number
-  rating: number
+  rating: number | null
   suggestion: string | null
   created_at: string
   first_question?: string | null

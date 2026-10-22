@@ -44,7 +44,7 @@ async function fetchInterviews() {
 }
 
 function isEvaluated(item: InterviewData | null): boolean {
-  return !!item && (item.rating > 0 || (item.suggestion != null && item.suggestion.length > 0))
+  return !!item && ((item.rating != null && item.rating > 0) || (item.suggestion != null && item.suggestion.length > 0))
 }
 
 async function startNew() {
@@ -174,7 +174,8 @@ function formatShortTime(iso: string): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function ratingText(r: number): string {
+function ratingText(r: number | null): string {
+  if (r == null) return '-'
   return Number.isInteger(r) ? String(r) : r.toFixed(1)
 }
 </script>

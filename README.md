@@ -51,10 +51,11 @@ MySQL（db 容器，不对外暴露端口，仅容器间访问）
 - AI 简历优化：对简历内容给出优化后文案
 
 ### AI 模拟面试模块
-- 开始面试：AI 面试官结合简历上下文生成第一道面试题
+- 开始面试：AI 面试官结合简历上下文生成第一道面试题（带防重复提交）
 - 多轮对话：AI 追问与应答，逐条保存会话消息
 - 结束面试：AI 对整场对话进行评估，输出评分与整体建议
-- 面试记录查看与删除（删除时先清理会话消息，再删除面试记录）
+- 面试状态管理：结束后的面试不可继续发消息、不可重复评估
+- 面试记录查看与删除（删除在事务内先清理会话消息，再删除面试记录）
 
 ## 技术栈
 
@@ -100,7 +101,7 @@ InterviewHelper/
 │   │   ├── hander/          # 全局异常处理器
 │   │   ├── converter/       # MapStruct 对象转换
 │   │   ├── result/          # 统一响应结构 Result
-│   │   └── util/            # JwtUtil、BCrypt、登录限流、UserContext
+│   │   └── util/            # JwtUtil、BCrypt、登录限流、UserContext、InterviewLocks 场次锁
 │   ├── src/main/resources/
 │   │   ├── application.yml  # 配置（敏感项全部走环境变量）
 │   │   ├── application-dev.yml / application-prod.yml
@@ -233,6 +234,7 @@ docker compose logs -f backend
 - 数据库数据通过 `db-data` 卷持久化，容器删除数据不丢
 - 首次启动 MySQL 时自动执行 `init.sql` 建库建表
 - `backend` 依赖数据库健康检查通过后才启动；MySQL 8 的 JDBC 连接串需带 `allowPublicKeyRetrieval=true`（已在编排文件中配置）
+- AI 服务以多 Worker 运行（`uvicorn --workers 4`），支撑 AI 长耗时调用的并发
 - 各服务 Dockerfile 均采用多阶段构建，仅保留运行时依赖
 - 国内部署已配置 Docker Hub 镜像加速、npm 淘宝源、Maven 阿里云源
 
@@ -280,12 +282,12 @@ Python AI 服务提供 4 个固定接口，请求 / 响应字段与 Java 侧 `Ai
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/interview/startInterview` | 开始面试，返回 AI 第一道题 |
-| POST | `/api/interview/sendMessage` | 发送回答，返回最新会话消息 |
+| POST | `/api/interview/startInterview` | 开始面试，返回 AI 第一道题（5 秒防重复提交） |
+| POST | `/api/interview/sendMessage` | 发送回答，返回最新会话消息（已结束的面试拒绝发送） |
 | GET | `/api/interview/viewMessages?interviewId=` | 查看会话消息 |
 | GET | `/api/interview/viewInterview` | 查看面试记录 |
-| POST | `/api/interview/endInterview` | 结束面试，返回评分与建议 |
-| DELETE | `/api/interview/deleteInterview` | 删除面试记录 |
+| POST | `/api/interview/endInterview` | 结束面试，返回评分与建议（不可重复结束） |
+| DELETE | `/api/interview/deleteInterview` | 删除面试记录（事务内先删消息） |
 
 ## 安全设计
 
@@ -299,6 +301,23 @@ Python AI 服务提供 4 个固定接口，请求 / 响应字段与 Java 侧 `Ai
 - **生产日志**：`prod` profile 关闭 SQL 打印，收敛日志级别，避免敏感数据落盘
 - **网络隔离**：部署时仅 Nginx 对外，数据库 / AI 服务 / Java 后端均不对外暴露端口
 - **密钥管理**：所有敏感配置走环境变量，`.env` 不提交版本控制
+- **入参校验**：全部 DTO 字段带 JSR-303 注解（`@Size` 上限与数据库列长对齐），拦截超长/非法输入，防止 SQL 截断错误与 AI 费用滥用
+
+## 并发与可靠性设计
+
+| 机制 | 实现 | 解决什么 |
+| --- | --- | --- |
+| 超时预算 | 排队 10s + 读超时 110s = 120s，不超过前端超时 | 用户永远收到后端友好提示，而非浏览器中断 |
+| 有限重试 | 仅「连接失败」重试 1 次，读超时不重试 | 抖动恢复不误伤，总耗时不超预算 |
+| 信号量限流 | `Semaphore(20)` + 10 秒排队，超时友好降级 | 高峰平滑降级，保护 AI 服务与上游模型 API |
+| 多 Worker | AI 服务 `uvicorn --workers 4` | AI 长耗时阻塞调用的并发瓶颈 |
+| 场次锁 | `InterviewLocks`（interviewId → ReentrantLock） | 同一场面试的问答/评估/删除串行，杜绝消息乱序 |
+| 状态机 | `interview.status`（0 进行中 / 1 已结束） | 结束后拒绝发消息与重复评估 |
+| 事务 | 删除面试 `@Transactional` 两步原子提交 | 不留"空面试"脏数据 |
+| 上下文截断 | Prompt 只拼最近 20 条消息 | 长面试不超模型上下文上限 |
+| 防重复提交 | 开始面试 5 秒防重窗口 + 用户级锁 + 前端按钮防抖 | 双击不重复建记录、不重复调用 AI |
+
+> 以上锁与限流为 JVM 级实现，适配当前单实例部署；多实例部署需迁移至 Redis 分布式锁/限流。
 
 ## 测试
 

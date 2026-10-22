@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS interview (
   user_id    INT      NULL COMMENT '所属用户ID',
   rating     FLOAT    NULL COMMENT '评分',
   suggestion TEXT     NULL COMMENT '整体建议',
+  status     TINYINT  NOT NULL DEFAULT 0 COMMENT '状态：0进行中 1已结束',
   created_at DATETIME NULL COMMENT '创建时间',
   PRIMARY KEY (id),
   KEY idx_interview_user (user_id),
