@@ -1,0 +1,34 @@
+# 密钥文件，禁止提交
+.env
+
+# ---------- Java 后端 ----------
+interview_helper_backend/target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---------- Python AI 服务 ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---------- 前端 ----------
+node_modules/
+dist/
+*.local
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.iml
+
+# ---------- 系统文件 ----------
+.DS_Store
+Thumbs.db
+
+# ---------- 日志 ----------
+*.log
+logs/

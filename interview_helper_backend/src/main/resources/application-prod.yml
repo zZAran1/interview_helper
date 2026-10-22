@@ -1,0 +1,11 @@
+# prod 环境：不打印 SQL（含密码哈希/手机号等敏感数据），收敛日志级别
+mybatis-plus:
+  configuration:
+    #禁用 StdOutImpl，避免 SQL（含参数）落到日志文件
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+logging:
+  level:
+    root: WARN
+    com.example.interview_helper_backend: INFO
+    org.springframework: WARN

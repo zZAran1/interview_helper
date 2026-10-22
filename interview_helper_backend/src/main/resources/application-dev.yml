@@ -1,0 +1,9 @@
+# dev 环境：本地开发调试用，打印 SQL 方便排查
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+logging:
+  level:
+    root: INFO
+    com.example.interview_helper_backend: DEBUG
